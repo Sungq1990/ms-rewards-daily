@@ -81,18 +81,21 @@ function renderStatus(st) {
   $('claimNow').disabled = !!st.running;
 
   const s = st.settings || {};
-  $('enabled').checked = !!s.enabled;
-  $('earnAfterDaily').checked = s.earnAfterDaily !== false;
-  $('searchAfterDaily').checked = s.searchAfterDaily !== false;
-  $('claimPointsAfter').checked = s.claimPointsAfter !== false;
-  $('mode').value = s.mode || 'daily';
-  $('dailyStart').value = s.dailyStart || '08:00';
-  $('dailyEnd').value = s.dailyEnd || '22:00';
-  $('intervalMin').value = s.intervalMin ?? 240;
-  $('jitterPct').value = s.jitterPct ?? 15;
-  $('dwellMinSec').value = s.dwellMinSec ?? 12;
-  $('dwellMaxSec').value = s.dwellMaxSec ?? 25;
-  $('searchTimeoutMin').value = s.searchTimeoutMin ?? 8;
+  // 用户正在改表单时不要用已保存的值覆盖输入框（否则 5 秒后的自动刷新会把改动刷回去）
+  if (!settingsDirty) {
+    $('enabled').checked = !!s.enabled;
+    $('earnAfterDaily').checked = s.earnAfterDaily !== false;
+    $('searchAfterDaily').checked = s.searchAfterDaily !== false;
+    $('claimPointsAfter').checked = s.claimPointsAfter !== false;
+    $('mode').value = s.mode || 'daily';
+    $('dailyStart').value = s.dailyStart || '08:00';
+    $('dailyEnd').value = s.dailyEnd || '22:00';
+    $('intervalMin').value = s.intervalMin ?? 240;
+    $('jitterPct').value = s.jitterPct ?? 15;
+    $('dwellMinSec').value = s.dwellMinSec ?? 12;
+    $('dwellMaxSec').value = s.dwellMaxSec ?? 25;
+    $('searchTimeoutMin').value = s.searchTimeoutMin ?? 15;
+  }
   syncModeFields();
 }
 
@@ -100,6 +103,20 @@ function syncModeFields() {
   const m = $('mode').value;
   $('dailyFields').classList.toggle('hidden', m !== 'daily');
   $('intervalFields').classList.toggle('hidden', m !== 'interval');
+}
+
+// 设置表单是否已被用户改动过；改动过就不再让自动刷新覆盖
+let settingsDirty = false;
+const FORM_FIELDS = [
+  'mode', 'dailyStart', 'dailyEnd', 'intervalMin', 'jitterPct',
+  'dwellMinSec', 'dwellMaxSec', 'searchTimeoutMin',
+  'earnAfterDaily', 'searchAfterDaily', 'claimPointsAfter',
+];
+for (const id of FORM_FIELDS) {
+  const el = $(id);
+  if (!el) continue;
+  el.addEventListener('input', () => { settingsDirty = true; });
+  el.addEventListener('change', () => { settingsDirty = true; });
 }
 
 async function refresh() {
@@ -164,6 +181,7 @@ $('saveSettings').addEventListener('click', async () => {
   if (settings.dwellMaxSec < settings.dwellMinSec) settings.dwellMaxSec = settings.dwellMinSec;
   const r = await send({ cmd: 'SAVE_SETTINGS', settings });
   if (r.ok) {
+    settingsDirty = false;
     $('saveSettings').textContent = '已保存 ✓';
     setTimeout(() => { $('saveSettings').textContent = '保存设置'; }, 1500);
     await refresh();
