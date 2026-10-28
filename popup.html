@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>微软积分每日任务</h1>
+    <span id="runningTag" class="tag hidden">运行中…</span>
+  </header>
+
+  <section class="status">
+    <div class="row"><span class="label">可用积分</span><span id="points">—</span></div>
+    <div class="row"><span class="label">上次运行</span><span id="lastRun">—</span></div>
+    <div class="row"><span class="label">上次结果</span><span id="lastResult">—</span></div>
+    <div class="row"><span class="label">下次自动运行</span><span id="nextRun">—</span></div>
+  </section>
+
+  <section class="actions">
+    <button id="runNow" class="primary">立即执行每日任务</button>
+    <button id="claimNow" class="secondary">只领取「可领取」积分</button>
+    <label class="toggle">
+      <input type="checkbox" id="enabled"> 启用定时自动执行
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="earnAfterDaily"> 完成后点击「积分赚取」页的日常任务
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="searchAfterDaily"> 完成后触发必应搜索打卡（油猴自动搜索）
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="claimPointsAfter"> 完成后领取页面上的“可领取”积分
+    </label>
+  </section>
+
+  <details id="settingsBox">
+    <summary>定时设置</summary>
+
+    <div class="field">
+      <label>执行模式</label>
+      <select id="mode">
+        <option value="daily">每天一次（窗口内随机时刻）</option>
+        <option value="interval">固定间隔（附加随机抖动）</option>
+      </select>
+    </div>
+
+    <div id="dailyFields" class="field-group">
+      <div class="field">
+        <label>随机时间窗口</label>
+        <div class="inline">
+          <input type="time" id="dailyStart"> 至
+          <input type="time" id="dailyEnd">
+        </div>
+        <p class="hint">每天在这个时间窗口内随机选一个时刻执行一次。</p>
+      </div>
+    </div>
+
+    <div id="intervalFields" class="field-group hidden">
+      <div class="field">
+        <label>执行间隔（分钟）</label>
+        <input type="number" id="intervalMin" min="30" max="1440" step="10">
+      </div>
+      <div class="field">
+        <label>随机抖动（±%）</label>
+        <input type="number" id="jitterPct" min="0" max="80" step="5">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>每个任务页停留时间（秒）</label>
+      <div class="inline">
+        <input type="number" id="dwellMinSec" min="5" max="120"> 至
+        <input type="number" id="dwellMaxSec" min="5" max="180">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>等待自动搜索脚本结束的最长时长（分钟）</label>
+      <input type="number" id="searchTimeoutMin" min="1" max="60">
+      <p class="hint">超时后搜索标签页保持打开，脚本可能仍在运行。</p>
+    </div>
+
+    <button id="saveSettings" class="primary">保存设置</button>
+  </details>
+
+  <footer id="log" class="hidden"></footer>
+  <script src="popup.js"></script>
+</body>
+</html>
