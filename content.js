@@ -12,21 +12,50 @@
 
   // 展开区块 + 滚动进视口 + 等待任务链接渲染
   // React 水合可能替换 #dailyset 节点，必须每轮重新查询，不能缓存引用
+
+  // 找"每日活动"区块：#dailyset 优先，找不到再按标题文字兜底（防页面改 id）
+  function dailySetSection() {
+    const ds = document.querySelector('#dailyset');
+    if (ds) return ds;
+    const heads = Array.from(document.querySelectorAll('h1, h2, h3, h4'))
+      .filter((el) => (el.textContent || '').trim().startsWith('每日活动'));
+    for (const h of heads) {
+      let n = h.parentElement;
+      for (let i = 0; i < 6 && n; i++, n = n.parentElement) {
+        if (n.querySelectorAll('a[href]').length > 0) return n;
+      }
+    }
+    return null;
+  }
+
+  // 只点标题旁真正的折叠开关；ⓘ「关于每日活动」是说明按钮，点它没用
+  function expandDailySet(ds) {
+    for (const b of ds.querySelectorAll('button[aria-expanded="false"]')) {
+      const label = (b.getAttribute('aria-label') || b.textContent || '').trim();
+      if (/^关于/.test(label)) continue;
+      b.click();
+      return true;
+    }
+    return false;
+  }
+
   async function ensureRendered() {
-    for (let i = 0; i < 40; i++) {
-      const ds = document.querySelector('#dailyset');
+    let lastErr = '未知状态';
+    for (let i = 0; i < 60; i++) { // 冷启动/网络慢时最长等 60 秒
+      const ds = dailySetSection();
       if (ds) {
-        const btn = ds.querySelector('button');
-        if (btn && btn.getAttribute('aria-expanded') === 'false') {
-          btn.click();
-        }
-        if (i % 3 === 0) ds.scrollIntoView({ block: 'center' });
+        if (expandDailySet(ds)) await sleep(600);
         const links = Array.from(ds.querySelectorAll('a[href]'));
         if (links.length > 0) return { section: ds, links };
+        lastErr = `已找到区块但没有任务卡片（a=${links.length}，button=${ds.querySelectorAll('button').length}）`;
+        if (i % 2 === 0) ds.scrollIntoView({ block: 'center' });
+      } else {
+        lastErr = '页面上没有 #dailyset 区块';
+        window.scrollBy(0, 300);
       }
-      await sleep(500);
+      await sleep(1000);
     }
-    throw new Error('每日活动卡片未渲染出来（可能今日任务已重置或页面结构变化）');
+    throw new Error(`每日活动卡片未渲染出来（${lastErr}，URL：${location.pathname}）`);
   }
 
   // 任务列表：{index, text, done, href}（"已完成"标记的卡片跳过不点）

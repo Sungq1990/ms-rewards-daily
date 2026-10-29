@@ -167,6 +167,18 @@ function waitTabComplete(tabId, timeoutMs = 45000) {
   });
 }
 
+// reload 之后先等它真的进入 loading，再等 complete；
+// 否则在页面还没开始跳转时就拿到旧的 "complete"，会在旧文档上操作
+async function waitTabReloaded(tabId, timeoutMs = 45000) {
+  const start = Date.now();
+  while (Date.now() - start < 8000) {
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t || t.status === 'loading') break;
+    await sleep(150);
+  }
+  return waitTabComplete(tabId, timeoutMs);
+}
+
 function sendToTab(tabId, msg, timeoutMs = 40000) {
   return new Promise((resolve) => {
     let done = false;
@@ -386,7 +398,7 @@ async function runEarnStep(settings, result) {
         const cur = await chrome.tabs.get(tab.id).catch(() => null);
         if (cur && !/\/earn/.test(cur.url || '')) {
           await chrome.tabs.update(tab.id, { url: 'https://rewards.bing.com/earn' }).catch(() => {});
-          await waitTabComplete(tab.id, 45000);
+          await waitTabReloaded(tab.id, 45000);
         }
       }
       info.clicked++;
@@ -422,8 +434,7 @@ async function runClaimStep(dashTabId, result) {
   result.claimStep = info;
   try {
     chrome.tabs.reload(dashTabId).catch(() => {});
-    await sleep(1500);
-    await waitTabComplete(dashTabId, 45000);
+    await waitTabReloaded(dashTabId, 45000);
     await chrome.tabs.update(dashTabId, { active: true }).catch(() => {});
     if (!(await waitForContentScript(dashTabId, 25))) {
       info.status = 'error';
@@ -520,7 +531,7 @@ async function runTasks(reason = 'manual') {
     if (dash) {
       dashTab = dash;
       chrome.tabs.reload(dashTab.id).catch(() => {});
-      await waitTabComplete(dashTab.id);
+      await waitTabReloaded(dashTab.id);
     } else {
       dashTab = await chrome.tabs.create({ url: 'https://rewards.bing.com/dashboard', active: false });
       await waitTabComplete(dashTab.id);
@@ -541,7 +552,7 @@ async function runTasks(reason = 'manual') {
     const ready = await waitForContentScript(dashTab.id);
     if (!ready) throw new Error('无法连接仪表盘页面脚本（请确认已登录微软积分并停留在 rewards.bing.com）');
 
-    const find = await sendToTab(dashTab.id, { cmd: 'FIND_TASKS' }, 90000);
+    const find = await sendToTab(dashTab.id, { cmd: 'FIND_TASKS' }, 120000);
     if (!find.ok) throw new Error(find.error || '定位每日任务失败');
     const tasks = find.tasks || [];
     result.total = tasks.length;
