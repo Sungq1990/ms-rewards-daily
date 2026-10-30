@@ -30,6 +30,9 @@
       <input type="checkbox" id="searchAfterDaily"> 完成后触发必应搜索打卡（油猴自动搜索）
     </label>
     <label class="toggle">
+      <input type="checkbox" id="searchNoWait"> 触发搜索后不等待跑完，直接去领积分
+    </label>
+    <label class="toggle">
       <input type="checkbox" id="claimPointsAfter"> 完成后领取页面上的“可领取”积分
     </label>
   </section>
@@ -78,7 +81,7 @@
     <div class="field">
       <label>等待自动搜索脚本结束的最长时长（分钟）</label>
       <input type="number" id="searchTimeoutMin" min="1" max="60">
-      <p class="hint">超时后搜索标签页保持打开，脚本可能仍在运行。</p>
+      <p class="hint">仅在关掉上面「不等待跑完」时生效；超时后搜索标签页保持打开，脚本可能仍在运行。</p>
     </div>
 
     <button id="saveSettings" class="primary">保存设置</button>

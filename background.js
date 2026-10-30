@@ -12,6 +12,7 @@ const DEFAULTS = {
   dwellMinSec: 12,          // 任务页最短停留
   dwellMaxSec: 25,          // 任务页最长停留
   searchAfterDaily: true,   // 每日任务完成后触发必应搜索打卡（油猴自动搜索）
+  searchNoWait: true,       // 触发搜索后不等待脚本跑完（true）还是等它结束（false）
   earnAfterDaily: true,     // 每日任务完成后，点击"积分赚取"页日常任务
   searchTimeoutMin: 15,     // 等待自动搜索脚本结束的最长时间（分钟）
   closeSearchTabAfterFinish: true, // 搜索脚本结束后关闭搜索标签页
@@ -348,7 +349,8 @@ const SEARCH_STATUS_TEXT = {
   skipped: '已跳过',
 };
 
-// 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 触发油猴"开始自动搜索"→ 等脚本结束
+// 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 触发油猴"开始自动搜索"。
+// 默认触发完就返回（脚本很慢，让它自己在后台跑），只有关掉 searchNoWait 才会等它结束。
 async function runSearchStep(dashTabId, settings, result, opts = {}) {
   const info = { status: 'skipped', startedAt: Date.now() };
   result.searchStep = info;
@@ -405,7 +407,15 @@ async function runSearchStep(dashTabId, settings, result, opts = {}) {
     info.status = trig.alreadyRunning ? 'already-running' : 'triggered';
     info.triggeredAt = Date.now();
     setBadge('搜索中', '#107c10');
-    await notify('微软积分每日任务', '已触发必应自动搜索，等待打卡完成…');
+    await notify('微软积分每日任务', '已触发必应自动搜索，接下来领取「可领取」积分…');
+
+    // 默认不等待：自动搜索脚本很慢（可能要十几分钟），触发成功就够了，
+    // 标签页保持打开让脚本继续跑，这里直接返回去领取积分。
+    if (settings.searchNoWait !== false) {
+      info.noWait = true;
+      info.finishedAt = Date.now();
+      return info;
+    }
 
     // 轮询按钮状态直到脚本结束或超时
     const deadline = Date.now() + Math.max(1, settings.searchTimeoutMin || 8) * 60000;
@@ -540,12 +550,15 @@ const CLAIM_STATUS_TEXT = {
   skipped: '已跳过',
 };
 
-// 领取"可领取"积分：这些奖励是搜索打卡完成后才出现的，所以要先刷新仪表盘再扫描。
+// 领取"可领取"积分：这些奖励是搜索打卡触发后才出现的，所以要先刷新仪表盘再扫描。
 // 每一步都是"扫一次就回"，等待放在这里（service worker 的定时器不会被页面节流拖慢）。
-async function runClaimStep(dashTabId, result) {
+// opts.graceMs：搜索刚触发后先等一会儿，给打卡记录留出出现的时间
+// opts.budgetMs：一共愿意为"等它出现"花多久（没东西可领时也会等满这么久）
+async function runClaimStep(dashTabId, result, opts = {}) {
   const info = { status: 'skipped', startedAt: Date.now(), clicked: [] };
   result.claimStep = info;
-  const rounds = 8;
+  const graceMs = opts.graceMs || 0;
+  const budgetMs = opts.budgetMs || 60000;
   let errors = 0;
   try {
     await bringToFront(dashTabId);
@@ -554,9 +567,10 @@ async function runClaimStep(dashTabId, result) {
       info.error = '页面刷新后没有就绪';
       return info;
     }
-    await sleep(2000);
+    if (graceMs > 0) await sleep(graceMs);
+    const deadline = Date.now() + budgetMs;
     let emptyStreak = 0;
-    for (let i = 0; i < rounds; i++) {
+    while (Date.now() < deadline) {
       const scan = await sendToTab(dashTabId, { cmd: 'CLAIM_SCAN' }, 20000);
       if (scan && scan.diag) info.diag = scan.diag;
       if (!scan || !scan.ok) {
@@ -571,9 +585,9 @@ async function runClaimStep(dashTabId, result) {
       }
       errors = 0;
       if (scan.none) {
-        // 卡片可能还没渲染出来：连扫两轮都空才收工
-        if (++emptyStreak >= 2) break;
-        await sleep(2500);
+        // 已经领过东西了、再连续两轮都空就收工；还没领到就继续等到预算用完
+        if (info.clicked.length > 0 && ++emptyStreak >= 2) break;
+        await sleep(4000);
         continue;
       }
       emptyStreak = 0;
@@ -612,7 +626,7 @@ async function runClaimOnly(reason = 'manual-claim') {
     await bringToFront(tab.id);
     await waitTabComplete(tab.id);
 
-    await runClaimStep(tab.id, result);
+    await runClaimStep(tab.id, result, { budgetMs: 30000 });
     result.clicked = result.claimStep && result.claimStep.clicked ? result.claimStep.clicked.length : 0;
     const sum = await sendToTab(tab.id, { cmd: 'SUMMARY' }, 10000);
     if (sum.ok && sum.summary && sum.summary.points) result.pointsAfter = sum.summary.points;
@@ -730,13 +744,21 @@ async function runTasks(reason = 'manual') {
     }
 
     // 6. 必应搜索连续打卡：点击"立即搜索"→新标签页→触发油猴自动搜索
+    //    默认触发成功就返回（脚本很慢，让它在后台自己跑）
     if (settings.searchAfterDaily) {
       await runSearchStep(dashTab.id, settings, result);
     }
 
-    // 7. 领取"可领取"积分（搜索打卡完成后才会出现）
+    // 7. 领取"可领取"积分（搜索打卡被触发后才会出现）
     if (settings.claimPointsAfter !== false) {
-      await runClaimStep(dashTab.id, result);
+      const st = result.searchStep && result.searchStep.status;
+      const justTriggered = st === 'triggered' || st === 'already-running';
+      // 刚触发搜索时多给点时间等"可领取"出现；否则（今日已搜过/未触发）快速扫一轮
+      await runClaimStep(
+        dashTab.id,
+        result,
+        justTriggered ? { graceMs: 20000, budgetMs: 150000 } : { budgetMs: 40000 }
+      );
     }
 
     // 8. 回读结果
@@ -749,7 +771,8 @@ async function runTasks(reason = 'manual') {
     setBadge('✓', '#107c10');
     setTimeout(() => setBadge(''), 8000);
     const searchNote = result.searchStep && result.searchStep.status
-      ? `；搜索打卡：${SEARCH_STATUS_TEXT[result.searchStep.status] || result.searchStep.status}`
+      ? `；搜索打卡：${SEARCH_STATUS_TEXT[result.searchStep.status] || result.searchStep.status}${
+        result.searchStep.noWait ? '（脚本在后台继续跑）' : ''}`
       : '';
     const earnNote = result.earnStep && result.earnStep.status
       ? `；赚取任务：${result.earnStep.clicked

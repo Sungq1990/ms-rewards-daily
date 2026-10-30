@@ -21,7 +21,7 @@ const SEARCH_TEXT = {
   'no-tab': '未打开搜索页',
   'content-not-ready': '搜索页未就绪',
   'trigger-failed': '未触发油猴',
-  triggered: '已触发',
+  triggered: '已触发（后台继续跑）',
   'already-running': '已在运行',
   finished: '已完成',
   'finished-tab-closed': '已完成',
@@ -86,6 +86,7 @@ function renderStatus(st) {
     $('enabled').checked = !!s.enabled;
     $('earnAfterDaily').checked = s.earnAfterDaily !== false;
     $('searchAfterDaily').checked = s.searchAfterDaily !== false;
+    $('searchNoWait').checked = s.searchNoWait !== false;
     $('claimPointsAfter').checked = s.claimPointsAfter !== false;
     $('mode').value = s.mode || 'daily';
     $('dailyStart').value = s.dailyStart || '08:00';
@@ -110,7 +111,7 @@ let settingsDirty = false;
 const FORM_FIELDS = [
   'mode', 'dailyStart', 'dailyEnd', 'intervalMin', 'jitterPct',
   'dwellMinSec', 'dwellMaxSec', 'searchTimeoutMin',
-  'earnAfterDaily', 'searchAfterDaily', 'claimPointsAfter',
+  'earnAfterDaily', 'searchAfterDaily', 'searchNoWait', 'claimPointsAfter',
 ];
 for (const id of FORM_FIELDS) {
   const el = $(id);
@@ -168,6 +169,7 @@ $('saveSettings').addEventListener('click', async () => {
     enabled: $('enabled').checked,
     earnAfterDaily: $('earnAfterDaily').checked,
     searchAfterDaily: $('searchAfterDaily').checked,
+    searchNoWait: $('searchNoWait').checked,
     claimPointsAfter: $('claimPointsAfter').checked,
     mode: $('mode').value,
     dailyStart: $('dailyStart').value || '08:00',
