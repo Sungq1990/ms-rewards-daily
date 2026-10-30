@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "微软积分每日任务助手",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "自动完成微软积分（Microsoft Rewards）每日活动的 3 个每日任务，点击“积分赚取”页的日常任务，完成后触发必应搜索连续打卡（配合油猴自动搜索脚本），并领取页面上出现的可领取积分：支持手动触发、每天随机时间或固定间隔（带随机抖动）自动执行。",
   "permissions": ["alarms", "storage", "tabs", "notifications"],
   "host_permissions": [

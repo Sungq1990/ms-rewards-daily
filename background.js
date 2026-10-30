@@ -182,7 +182,16 @@ async function waitTabReloaded(tabId, timeoutMs = 45000) {
 function sendToTab(tabId, msg, timeoutMs = 40000) {
   return new Promise((resolve) => {
     let done = false;
-    const t = setTimeout(() => { if (!done) { done = true; resolve({ ok: false, error: 'timeout' }); } }, timeoutMs);
+    const t = setTimeout(() => {
+      if (!done) {
+        done = true;
+        resolve({
+          ok: false,
+          timeout: true,
+          error: `页面脚本 ${Math.round(timeoutMs / 1000)} 秒未响应（标签页可能被 Chrome 挂起或节流）`,
+        });
+      }
+    }, timeoutMs);
     chrome.tabs.sendMessage(tabId, msg, (resp) => {
       if (done) return;
       done = true;
@@ -196,11 +205,115 @@ function sendToTab(tabId, msg, timeoutMs = 40000) {
 async function waitForContentScript(tabId, tries = 30) {
   for (let i = 0; i < tries; i++) {
     const r = await sendToTab(tabId, { cmd: 'PING' }, 3000);
-    if (r.ok) return true;
+    if (r.ok) return r;
     await sleep(1200);
   }
-  return false;
+  return null;
 }
+
+// 页面处于后台/被遮挡时，前台化窗口和标签页是唯一能让 Chrome 停止节流的手段
+async function bringToFront(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const win = await chrome.windows.get(tab.windowId);
+    if (win.state === 'minimized') await chrome.windows.update(tab.windowId, { state: 'normal' });
+    if (!win.focused) await chrome.windows.update(tab.windowId, { focused: true });
+    if (!tab.active) await chrome.tabs.update(tabId, { active: true });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 重新加载并等到"新文档"就绪：旧文档上发的消息会随导航一起丢失，所以要等 timeOrigin 变化
+async function reloadForFresh(tabId, timeoutMs = 45000) {
+  const before = await sendToTab(tabId, { cmd: 'PING' }, 2500);
+  const oldOrigin = before && before.ok ? before.timeOrigin : 0;
+  await chrome.tabs.reload(tabId).catch(() => {});
+  await waitTabReloaded(tabId, timeoutMs);
+  const deadline = Date.now() + 25000;
+  while (Date.now() < deadline) {
+    const p = await sendToTab(tabId, { cmd: 'PING' }, 2500);
+    if (p && p.ok) {
+      if (!oldOrigin || (p.timeOrigin && p.timeOrigin !== oldOrigin)) return p;
+    }
+    await sleep(500);
+  }
+  return null;
+}
+
+// 页面是否真的可见（hidden 时 Chrome 会把定时器节流到 1 次/分钟）
+async function pageDiag(tabId) {
+  const d = await sendToTab(tabId, { cmd: 'DIAG' }, 4000);
+  return d && d.ok ? d.diag : null;
+}
+
+function diagText(diag) {
+  if (!diag) return '页面无响应';
+  const parts = [`可见性=${diag.visibility || '?'}`];
+  if (diag.focused === false) parts.push('窗口未聚焦');
+  parts.push(diag.dailySet ? `#dailyset 在，卡片 ${diag.dailyLinks} 个` : '无 #dailyset');
+  if (diag.folded && diag.folded.length) parts.push(`仍折叠：[${diag.folded.join(',')}]`);
+  return parts.join('，');
+}
+
+// 轮询"每日活动"直到卡片渲染出来。页面里的 setTimeout 会被 Chrome 节流，
+// 所以等待和重试全部由 background（service worker，不受页面节流影响）来做。
+async function findTasksReady(tabId, timeoutMs = 90000) {
+  const deadline = Date.now() + timeoutMs;
+  let tries = 0;
+  let unresponsive = 0;
+  let reloaded = false;
+  let lastReason = '页面未返回结果';
+  let lastDiag = null;
+  while (Date.now() < deadline) {
+    tries++;
+    const r = await sendToTab(tabId, { cmd: 'FIND_TASKS' }, 12000);
+    if (r && r.ok && r.ready && r.tasks && r.tasks.length) return { ...r, tries };
+    if (r && r.timeout) unresponsive++;
+    else if (r && r.reason) lastReason = r.reason;
+    if (r && r.diag) lastDiag = r.diag;
+
+    // 页面整体无响应（可能被 Chrome 挂起/冻结）：重新加载一次再继续
+    if (unresponsive >= 3 && !reloaded) {
+      reloaded = true;
+      unresponsive = 0;
+      await reloadForFresh(tabId, 45000);
+      await sleep(1500);
+      continue;
+    }
+    // 每 5 次尝试重新前台化一次，避免窗口最小化/被遮挡导致页面一直 hidden
+    if (tries % 5 === 0) await bringToFront(tabId);
+    await sleep(2000);
+  }
+  if (!lastDiag) lastDiag = await pageDiag(tabId);
+  const err = new Error(`每日活动未渲染：${lastReason}（${diagText(lastDiag)}；已重试 ${tries} 次）`);
+  err.diag = lastDiag;
+  throw err;
+}
+
+async function waitSearchEntry(tabId, timeoutMs = 40000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await sendToTab(tabId, { cmd: 'FIND_SEARCH_TASK' }, 12000);
+    if (last && last.ok && last.found) return last;
+    await sleep(1500);
+  }
+  return last || { ok: false, error: '未找到“立即搜索”入口' };
+}
+
+async function findEarnReady(tabId, timeoutMs = 45000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await sendToTab(tabId, { cmd: 'FIND_EARN_TASKS' }, 12000);
+    if (last && last.ok && last.found) return last;
+    await sleep(1500);
+  }
+  return last || { ok: false, error: '未找到“日常任务”区块' };
+}
+
 
 // 等待新任务标签页出现（相对 before 集合的新增页面）
 function waitForNewTab(beforeIds, timeoutMs = 20000, urlRe = /^https:\/\/(www|cn)\.bing\.com\//) {
@@ -240,11 +353,11 @@ async function runSearchStep(dashTabId, settings, result, opts = {}) {
   const info = { status: 'skipped', startedAt: Date.now() };
   result.searchStep = info;
   try {
-    const find = await sendToTab(dashTabId, { cmd: 'FIND_SEARCH_TASK' }, 30000);
+    const find = await waitSearchEntry(dashTabId, 40000);
     info.counterBefore = find && find.counter ? find.counter.text : null;
     if (!find || !find.found) {
       info.status = 'not-found';
-      info.error = (find && find.error) || '未找到“立即搜索”入口';
+      info.error = (find && (find.error || find.reason)) || '未找到“立即搜索”入口';
       return info;
     }
     if (!opts.force && find.counter && find.counter.total > 0 && find.counter.cur >= find.counter.total) {
@@ -354,10 +467,7 @@ async function runEarnStep(settings, result) {
       tab = await chrome.tabs.create({ url: 'https://rewards.bing.com/earn', active: false });
       created = true;
     }
-    const win = await chrome.windows.get(tab.windowId);
-    if (win.state === 'minimized') await chrome.windows.update(tab.windowId, { state: 'normal' });
-    if (win.focused === false) await chrome.windows.update(tab.windowId, { focused: true });
-    await chrome.tabs.update(tab.id, { active: true });
+    await bringToFront(tab.id);
     await waitTabComplete(tab.id, 45000);
     if (!(await waitForContentScript(tab.id, 25))) {
       info.status = 'error';
@@ -365,13 +475,14 @@ async function runEarnStep(settings, result) {
       return info;
     }
 
-    const find = await sendToTab(tab.id, { cmd: 'FIND_EARN_TASKS' }, 60000);
+    const find = await findEarnReady(tab.id, 45000);
     if (!find || !find.ok) {
       info.status = 'error';
       info.error = (find && find.error) || '定位“日常任务”区块失败';
       return info;
     }
     info.tasks = find.tasks || [];
+    if (!find.found) info.reason = find.reason || '未找到“日常任务”区块';
     info.total = info.tasks.length;
     const withPoints = info.tasks.filter((t) => t.points != null).length;
     const pending = info.tasks.filter((t) => !t.done && (withPoints === 0 || t.points != null));
@@ -399,13 +510,14 @@ async function runEarnStep(settings, result) {
         if (cur && !/\/earn/.test(cur.url || '')) {
           await chrome.tabs.update(tab.id, { url: 'https://rewards.bing.com/earn' }).catch(() => {});
           await waitTabReloaded(tab.id, 45000);
+          await waitForContentScript(tab.id, 15);
         }
       }
       info.clicked++;
       setBadge(`赚取${info.clicked}`, '#107c10');
       await sleep(randInt(2500, 6000));
       // 卡片状态会变，重新取一次列表
-      const again = await sendToTab(tab.id, { cmd: 'FIND_EARN_TASKS' }, 60000);
+      const again = await sendToTab(tab.id, { cmd: 'FIND_EARN_TASKS' }, 15000);
       if (again && again.ok && again.tasks) info.tasks = again.tasks;
     }
     info.status = info.clicked > 0 ? 'clicked' : 'none';
@@ -428,35 +540,55 @@ const CLAIM_STATUS_TEXT = {
   skipped: '已跳过',
 };
 
-// 领取"可领取"积分：这些奖励是搜索打卡完成后才出现的，所以要先刷新仪表盘再扫描
+// 领取"可领取"积分：这些奖励是搜索打卡完成后才出现的，所以要先刷新仪表盘再扫描。
+// 每一步都是"扫一次就回"，等待放在这里（service worker 的定时器不会被页面节流拖慢）。
 async function runClaimStep(dashTabId, result) {
   const info = { status: 'skipped', startedAt: Date.now(), clicked: [] };
   result.claimStep = info;
+  const rounds = 8;
+  let errors = 0;
   try {
-    chrome.tabs.reload(dashTabId).catch(() => {});
-    await waitTabReloaded(dashTabId, 45000);
-    await chrome.tabs.update(dashTabId, { active: true }).catch(() => {});
-    if (!(await waitForContentScript(dashTabId, 25))) {
+    await bringToFront(dashTabId);
+    if (!(await reloadForFresh(dashTabId, 45000))) {
       info.status = 'error';
-      info.error = '页面脚本未就绪';
+      info.error = '页面刷新后没有就绪';
       return info;
     }
-    await sleep(2500);
-    let r = await sendToTab(dashTabId, { cmd: 'CLAIM_POINTS' }, 150000);
-    if (!r || !r.ok) {
-      // 可能正好撞上刷新（消息发到了旧文档），重新等脚本就绪后再试一次
-      await waitForContentScript(dashTabId, 10);
-      await sleep(1500);
-      r = await sendToTab(dashTabId, { cmd: 'CLAIM_POINTS' }, 150000);
+    await sleep(2000);
+    let emptyStreak = 0;
+    for (let i = 0; i < rounds; i++) {
+      const scan = await sendToTab(dashTabId, { cmd: 'CLAIM_SCAN' }, 20000);
+      if (scan && scan.diag) info.diag = scan.diag;
+      if (!scan || !scan.ok) {
+        // 撞上刷新/页面卡顿时重试一次，连续失败才算错
+        if (++errors >= 2) {
+          info.status = 'error';
+          info.error = (scan && scan.error) || '领取扫描失败';
+          return info;
+        }
+        await sleep(1500);
+        continue;
+      }
+      errors = 0;
+      if (scan.none) {
+        // 卡片可能还没渲染出来：连扫两轮都空才收工
+        if (++emptyStreak >= 2) break;
+        await sleep(2500);
+        continue;
+      }
+      emptyStreak = 0;
+      if (scan.clicked) info.clicked.push(scan.clicked);
+      await sleep(1600);
+      // 抽屉/弹窗里的「领取积分」：点到找不到为止
+      for (let k = 0; k < 4; k++) {
+        const c = await sendToTab(dashTabId, { cmd: 'CLAIM_CONFIRM' }, 15000);
+        if (!c || !c.ok || !c.clicked) break;
+        await sleep(1200);
+      }
+      await sleep(600);
     }
-    if (!r || !r.ok) {
-      info.status = 'error';
-      info.error = (r && r.error) || '领取失败';
-      return info;
-    }
-    info.clicked = r.clicked || [];
-    if (r.diag) info.diag = r.diag;
-    if (r.summary && r.summary.points) info.points = r.summary.points;
+    const sum = await sendToTab(dashTabId, { cmd: 'SUMMARY' }, 10000);
+    if (sum && sum.ok && sum.summary && sum.summary.points) info.points = sum.summary.points;
     info.status = info.clicked.length > 0 ? 'claimed' : 'none';
   } catch (e) {
     info.status = 'error';
@@ -477,15 +609,12 @@ async function runClaimOnly(reason = 'manual-claim') {
     const existing = await findDashboardTabs();
     const dash = existing.find((t) => /\/dashboard|\/$/.test((t.url || '').replace(/[?#].*$/, ''))) || existing[0];
     const tab = dash || await chrome.tabs.create({ url: 'https://rewards.bing.com/dashboard', active: true });
-    const win = await chrome.windows.get(tab.windowId);
-    if (win.state === 'minimized') await chrome.windows.update(tab.windowId, { state: 'normal' });
-    if (win.focused === false) await chrome.windows.update(tab.windowId, { focused: true });
-    await chrome.tabs.update(tab.id, { active: true });
+    await bringToFront(tab.id);
     await waitTabComplete(tab.id);
 
     await runClaimStep(tab.id, result);
     result.clicked = result.claimStep && result.claimStep.clicked ? result.claimStep.clicked.length : 0;
-    const sum = await sendToTab(tab.id, { cmd: 'SUMMARY' });
+    const sum = await sendToTab(tab.id, { cmd: 'SUMMARY' }, 10000);
     if (sum.ok && sum.summary && sum.summary.points) result.pointsAfter = sum.summary.points;
     result.ok = result.claimStep.status !== 'error';
 
@@ -530,37 +659,38 @@ async function runTasks(reason = 'manual') {
     const dash = existing.find((t) => /\/dashboard|\/$/.test((t.url || '').replace(/[?#].*$/, ''))) || existing[0];
     if (dash) {
       dashTab = dash;
-      chrome.tabs.reload(dashTab.id).catch(() => {});
-      await waitTabReloaded(dashTab.id);
     } else {
       dashTab = await chrome.tabs.create({ url: 'https://rewards.bing.com/dashboard', active: false });
-      await waitTabComplete(dashTab.id);
     }
 
-    // 2. 激活到前台：后台标签页/最小化窗口的定时器和懒渲染会被 Chrome 节流，必须前台执行
+    // 2. 先记下用户原来的活动标签页（结束后还原），再把这个标签页切到前台并激活窗口：
+    //    后台标签页/最小化窗口的定时器和懒渲染会被 Chrome 节流
     let prevTab = null;
     try {
-      const win = await chrome.windows.get(dashTab.windowId);
-      if (win.state === 'minimized') await chrome.windows.update(dashTab.windowId, { state: 'normal' });
-      if (win.focused === false) await chrome.windows.update(dashTab.windowId, { focused: true });
       const activeTabs = await chrome.tabs.query({ active: true, windowId: dashTab.windowId });
       prevTab = activeTabs[0] && activeTabs[0].id !== dashTab.id ? activeTabs[0].id : null;
-      await chrome.tabs.update(dashTab.id, { active: true });
-    } catch (e) { /* 激活失败不阻塞流程 */ }
+    } catch (e) { /* 取不到就最后不还原 */ }
+    await bringToFront(dashTab.id);
+
+    // 刷新后要等到"新文档"就绪，避免在正在被替换的旧页面上操作
+    if (dash) await reloadForFresh(dashTab.id);
+    else await waitTabComplete(dashTab.id);
 
     // 3. 等 content script 就绪
     const ready = await waitForContentScript(dashTab.id);
     if (!ready) throw new Error('无法连接仪表盘页面脚本（请确认已登录微软积分并停留在 rewards.bing.com）');
+    result.visibility = ready.visibility || null;
 
-    const find = await sendToTab(dashTab.id, { cmd: 'FIND_TASKS' }, 120000);
-    if (!find.ok) throw new Error(find.error || '定位每日任务失败');
+    // 4. 轮询等"每日活动"渲染（等待放在后台，页面里的定时器会被 Chrome 节流）
+    const find = await findTasksReady(dashTab.id, 120000);
     const tasks = find.tasks || [];
     result.total = tasks.length;
+    result.attempts = find.tries || null;
     result.pending = tasks.filter((t) => !t.done).length;
     result.summary = find.summary || null;
     if (find.summary && find.summary.points) result.pointsBefore = find.summary.points;
 
-    // 4. 逐个点击未完成的任务；点击后的新标签页停留随机时间再关闭
+    // 5. 逐个点击未完成的任务；点击后的新标签页停留随机时间再关闭
     const pending = tasks.filter((t) => !t.done);
     if (pending.length === 0) {
       result.clicked = 0;
@@ -611,7 +741,7 @@ async function runTasks(reason = 'manual') {
 
     // 8. 回读结果
     await sleep(2000);
-    const sum = await sendToTab(dashTab.id, { cmd: 'SUMMARY' });
+    const sum = await sendToTab(dashTab.id, { cmd: 'SUMMARY' }, 10000);
     if (sum.ok && sum.summary) {
       if (sum.summary.points) result.pointsAfter = sum.summary.points;
       result.afterSummary = sum.summary;
@@ -642,6 +772,7 @@ async function runTasks(reason = 'manual') {
   } catch (e) {
     result.ok = false;
     result.error = String((e && e.message) || e);
+    if (e && e.diag) result.diag = e.diag;
     setBadge('!', '#d83b01');
     setTimeout(() => setBadge(''), 10000);
     await notify('微软积分每日任务失败', result.error);

@@ -61,7 +61,7 @@ function renderStatus(st) {
   const lr = st.lastRun;
   $('lastRun').textContent = lr ? fmtTime(lr.finishedAt || lr.startedAt) : '—';
   if (lr) {
-    let res = lr.ok ? `完成 ${lr.clicked}/${lr.total} 个任务` : `失败：${(lr.error || '未知错误').slice(0, 60)}`;
+    let res = lr.ok ? `完成 ${lr.clicked}/${lr.total} 个任务` : `失败：${(lr.error || '未知错误').slice(0, 180)}`;
     if (lr.earnStep && lr.earnStep.status) {
       res += `；赚取任务：${earnText(lr.earnStep)}`;
     }
