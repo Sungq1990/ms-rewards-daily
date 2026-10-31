@@ -255,7 +255,36 @@ function diagText(diag) {
   if (diag.focused === false) parts.push('窗口未聚焦');
   parts.push(diag.dailySet ? `#dailyset 在，卡片 ${diag.dailyLinks} 个` : '无 #dailyset');
   if (diag.folded && diag.folded.length) parts.push(`仍折叠：[${diag.folded.join(',')}]`);
+  if (diag.visibility === 'hidden') parts.push('（页面不可见时懒渲染不会加载，需让窗口可见）');
   return parts.join('，');
+}
+
+// 自动化专用仪表盘。关键约束：页面处于 hidden（窗口被遮挡/最小化/锁屏）时，
+// Chrome 的 IntersectionObserver 不会命中，React 懒渲染的「每日活动」卡片永远不会加载，
+// 等再久也没用——所以必须保证页面可见。
+// 优先复用已可见的仪表盘标签页；不行就开一个独立窗口来跑（用完关闭）。
+async function ensureVisibleDashboard() {
+  const existing = await findDashboardTabs();
+  const dash = existing.find((t) => /\/dashboard|\/$/.test((t.url || '').replace(/[?#].*$/, ''))) || existing[0];
+  const userWinId = dash
+    ? dash.windowId
+    : (await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).then((w) => w.id).catch(() => null));
+  if (dash) {
+    await bringToFront(dash.id);
+    const d = await pageDiag(dash.id);
+    if (d && d.visibility === 'visible') {
+      return { tabId: dash.id, windowId: dash.windowId, userWinId, ownWinId: null, reused: true };
+    }
+  }
+  const win = await chrome.windows.create({
+    url: 'https://rewards.bing.com/dashboard',
+    focused: true,
+    type: 'normal',
+    width: 1280,
+    height: 900,
+  });
+  const tab = win && win.tabs && win.tabs[0];
+  return { tabId: tab ? tab.id : null, windowId: win ? win.id : null, userWinId, ownWinId: win ? win.id : null, reused: false };
 }
 
 // 轮询"每日活动"直到卡片渲染出来。页面里的 setTimeout 会被 Chrome 节流，
@@ -464,17 +493,25 @@ const EARN_STATUS_TEXT = {
   skipped: '已跳过',
 };
 
-// 积分赚取页（/earn）的"日常任务"：与首页每日活动不同，这里要逐张卡片点击
-async function runEarnStep(settings, result) {
+// 积分赚取页（/earn）的"日常任务"：与首页每日活动不同，这里要逐张卡片点击。
+// ownWinId 存在时（本次运行开了独立窗口），在该窗口里新开 /earn 用完即关，
+// 避免复用用户藏在后台窗口里的旧标签页（hidden 状态下懒渲染不加载）。
+async function runEarnStep(settings, result, ownWinId = null) {
   const info = { status: 'skipped', startedAt: Date.now(), clicked: 0, tasks: [] };
   result.earnStep = info;
   let tab = null;
   let created = false;
   try {
     const all = await chrome.tabs.query({ url: 'https://rewards.bing.com/*' });
-    tab = all.find((t) => /\/earn(\?|#|$)/.test(t.url || '')) || null;
+    tab = ownWinId == null
+      ? (all.find((t) => /\/earn(\?|#|$)/.test(t.url || '')) || null)
+      : null;
     if (!tab) {
-      tab = await chrome.tabs.create({ url: 'https://rewards.bing.com/earn', active: false });
+      tab = await chrome.tabs.create({
+        url: 'https://rewards.bing.com/earn',
+        windowId: ownWinId || undefined,
+        active: true,
+      });
       created = true;
     }
     await bringToFront(tab.id);
@@ -619,16 +656,15 @@ async function runClaimOnly(reason = 'manual-claim') {
   keepAlive(true);
   setBadge('...', '#d83b01');
   const result = { ok: true, reason, startedAt: Date.now(), clicked: 0, pointsAfter: null };
+  let ownWinId = null;
   try {
-    const existing = await findDashboardTabs();
-    const dash = existing.find((t) => /\/dashboard|\/$/.test((t.url || '').replace(/[?#].*$/, ''))) || existing[0];
-    const tab = dash || await chrome.tabs.create({ url: 'https://rewards.bing.com/dashboard', active: true });
-    await bringToFront(tab.id);
-    await waitTabComplete(tab.id);
+    const vis = await ensureVisibleDashboard();
+    if (!vis.tabId) throw new Error('无法打开仪表盘页面');
+    ownWinId = vis.ownWinId;
 
-    await runClaimStep(tab.id, result, { budgetMs: 30000 });
+    await runClaimStep(vis.tabId, result, { budgetMs: 30000 });
     result.clicked = result.claimStep && result.claimStep.clicked ? result.claimStep.clicked.length : 0;
-    const sum = await sendToTab(tab.id, { cmd: 'SUMMARY' }, 10000);
+    const sum = await sendToTab(vis.tabId, { cmd: 'SUMMARY' }, 10000);
     if (sum.ok && sum.summary && sum.summary.points) result.pointsAfter = sum.summary.points;
     result.ok = result.claimStep.status !== 'error';
 
@@ -650,6 +686,7 @@ async function runClaimOnly(reason = 'manual-claim') {
     setTimeout(() => setBadge(''), 8000);
     await notify('微软积分领取失败', result.error);
   } finally {
+    if (ownWinId != null) await chrome.windows.remove(ownWinId).catch(() => {});
     result.finishedAt = Date.now();
     await saveState({ lastClaim: result });
     running = false;
@@ -667,35 +704,48 @@ async function runTasks(reason = 'manual') {
   const result = { ok: true, reason, startedAt: Date.now(), total: 0, clicked: 0, error: null, pointsBefore: null, pointsAfter: null };
 
   let dashTab = null;
+  let ownWinId = null;   // 本次运行专用的独立窗口（用完关闭）
+  let userWinId = null;  // 用户原来的窗口（后台仍在跑的搜索标签页要挪回那里）
+  let prevTab = null;
   try {
-    // 1. 找到或打开仪表盘
-    const existing = await findDashboardTabs();
-    const dash = existing.find((t) => /\/dashboard|\/$/.test((t.url || '').replace(/[?#].*$/, ''))) || existing[0];
-    if (dash) {
-      dashTab = dash;
-    } else {
-      dashTab = await chrome.tabs.create({ url: 'https://rewards.bing.com/dashboard', active: false });
+    // 1. 准备一个"可见"的仪表盘：页面 hidden 时「每日活动」卡片不会懒加载，等再久也没用。
+    //    优先复用已可见的标签页；否则开独立窗口执行。
+    const vis = await ensureVisibleDashboard();
+    if (!vis.tabId) throw new Error('无法打开仪表盘页面');
+    dashTab = { id: vis.tabId, windowId: vis.windowId };
+    ownWinId = vis.ownWinId;
+    userWinId = vis.userWinId;
+    result.dashWindow = ownWinId != null ? 'own' : 'reused';
+
+    // 复用现有标签页时，先记下用户原来的活动标签页（结束后还原）
+    if (ownWinId == null) {
+      try {
+        const activeTabs = await chrome.tabs.query({ active: true, windowId: dashTab.windowId });
+        prevTab = activeTabs[0] && activeTabs[0].id !== dashTab.id ? activeTabs[0].id : null;
+      } catch (e) { /* 取不到就最后不还原 */ }
     }
 
-    // 2. 先记下用户原来的活动标签页（结束后还原），再把这个标签页切到前台并激活窗口：
-    //    后台标签页/最小化窗口的定时器和懒渲染会被 Chrome 节流
-    let prevTab = null;
-    try {
-      const activeTabs = await chrome.tabs.query({ active: true, windowId: dashTab.windowId });
-      prevTab = activeTabs[0] && activeTabs[0].id !== dashTab.id ? activeTabs[0].id : null;
-    } catch (e) { /* 取不到就最后不还原 */ }
-    await bringToFront(dashTab.id);
-
     // 刷新后要等到"新文档"就绪，避免在正在被替换的旧页面上操作
-    if (dash) await reloadForFresh(dashTab.id);
+    if (vis.reused) await reloadForFresh(dashTab.id);
     else await waitTabComplete(dashTab.id);
 
-    // 3. 等 content script 就绪
+    // 2. 等 content script 就绪
     const ready = await waitForContentScript(dashTab.id);
     if (!ready) throw new Error('无法连接仪表盘页面脚本（请确认已登录微软积分并停留在 rewards.bing.com）');
     result.visibility = ready.visibility || null;
 
-    // 4. 轮询等"每日活动"渲染（等待放在后台，页面里的定时器会被 Chrome 节流）
+    // 页面仍不可见（屏幕锁定/被全屏遮挡）就没法继续：懒渲染永远不会加载
+    let d0 = await pageDiag(dashTab.id);
+    if (!d0 || d0.visibility !== 'visible') {
+      await bringToFront(dashTab.id);
+      await sleep(1500);
+      d0 = await pageDiag(dashTab.id);
+      if (!d0 || d0.visibility !== 'visible') {
+        throw new Error('页面无法变为可见（可能屏幕已锁定或被全屏程序遮挡），「每日活动」卡片不会加载');
+      }
+    }
+
+    // 3. 轮询等"每日活动"渲染（等待放在后台，页面里的定时器会被 Chrome 节流）
     const find = await findTasksReady(dashTab.id, 120000);
     const tasks = find.tasks || [];
     result.total = tasks.length;
@@ -735,9 +785,9 @@ async function runTasks(reason = 'manual') {
       await sleep(randInt(3000, 8000)); // 任务间隔，行为更接近真人
     }
 
-    // 5. 积分赚取页的"日常任务"
+    // 5. 积分赚取页的"日常任务"（用自己的窗口时在该窗口里新开，用完即关）
     if (settings.earnAfterDaily !== false) {
-      await runEarnStep(settings, result);
+      await runEarnStep(settings, result, ownWinId);
       // 回到仪表盘，继续后面的搜索打卡
       await chrome.tabs.update(dashTab.id, { active: true }).catch(() => {});
       await sleep(1000);
@@ -787,11 +837,6 @@ async function runTasks(reason = 'manual') {
     await notify('微软积分每日任务', result.clicked > 0
       ? `已执行 ${result.clicked} 个每日任务${result.pointsAfter && result.pointsBefore ? `，积分 ${result.pointsBefore} → ${result.pointsAfter}` : ''}${earnNote}${searchNote}${claimNote}。`
       : (result.note || '每日任务已全部完成') + earnNote + searchNote + claimNote);
-
-    // 9. 还原用户原来的活动标签页（搜索标签页如仍在运行则保持不动）
-    if (prevTab != null) {
-      chrome.tabs.update(prevTab, { active: true }).catch(() => {});
-    }
   } catch (e) {
     result.ok = false;
     result.error = String((e && e.message) || e);
@@ -800,6 +845,21 @@ async function runTasks(reason = 'manual') {
     setTimeout(() => setBadge(''), 10000);
     await notify('微软积分每日任务失败', result.error);
   } finally {
+    // 收尾：独立窗口用完就关（成功/失败都要）；还在后台跑自动搜索的标签页先挪回用户窗口
+    try {
+      if (ownWinId != null) {
+        const searchTabId = result.searchStep && result.searchStep.noWait ? result.searchStep.tabId : null;
+        if (searchTabId && userWinId != null && userWinId !== ownWinId) {
+          await chrome.tabs.move(searchTabId, { windowId: userWinId, index: -1 }).catch(() => {});
+          await chrome.tabs.update(searchTabId, { active: false }).catch(() => {});
+        }
+        if (!searchTabId || userWinId != null) {
+          await chrome.windows.remove(ownWinId).catch(() => {});
+        }
+      } else if (prevTab != null) {
+        chrome.tabs.update(prevTab, { active: true }).catch(() => {});
+      }
+    } catch (e) { /* 收尾失败不影响结果 */ }
     result.finishedAt = Date.now();
     await saveState({ lastRun: result });
     running = false;
