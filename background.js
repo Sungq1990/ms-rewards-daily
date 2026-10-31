@@ -596,31 +596,35 @@ async function runClaimStep(dashTabId, result, opts = {}) {
   result.claimStep = info;
   const graceMs = opts.graceMs || 0;
   const budgetMs = opts.budgetMs || 60000;
-  let errors = 0;
   try {
     await bringToFront(dashTabId);
     if (!(await reloadForFresh(dashTabId, 45000))) {
       info.status = 'error';
       info.error = '页面刷新后没有就绪';
+      info.finishedAt = Date.now();
       return info;
     }
     if (graceMs > 0) await sleep(graceMs);
     const deadline = Date.now() + budgetMs;
     let emptyStreak = 0;
+    let consecutiveFail = 0;
     while (Date.now() < deadline) {
       const scan = await sendToTab(dashTabId, { cmd: 'CLAIM_SCAN' }, 20000);
       if (scan && scan.diag) info.diag = scan.diag;
       if (!scan || !scan.ok) {
-        // 撞上刷新/页面卡顿时重试一次，连续失败才算错
-        if (++errors >= 2) {
+        // 撞上页面跳转/刷新（接收端暂时消失）：等脚本重新就绪后继续，直到预算用完
+        consecutiveFail++;
+        const re = await waitForContentScript(dashTabId, 12);
+        if (!re && consecutiveFail >= 3) {
           info.status = 'error';
-          info.error = (scan && scan.error) || '领取扫描失败';
+          info.error = (scan && scan.error) || '领取扫描失败（页面脚本无法恢复）';
+          info.finishedAt = Date.now();
           return info;
         }
         await sleep(1500);
         continue;
       }
-      errors = 0;
+      consecutiveFail = 0;
       if (scan.none) {
         // 已经领过东西了、再连续两轮都空就收工；还没领到就继续等到预算用完
         if (info.clicked.length > 0 && ++emptyStreak >= 2) break;
@@ -630,7 +634,7 @@ async function runClaimStep(dashTabId, result, opts = {}) {
       emptyStreak = 0;
       if (scan.clicked) info.clicked.push(scan.clicked);
       await sleep(1600);
-      // 抽屉/弹窗里的「领取积分」：点到找不到为止
+      // 抽屉/弹窗里的「领取积分」：点到找不到为止（期间页面若跳转会由下一轮扫描重连）
       for (let k = 0; k < 4; k++) {
         const c = await sendToTab(dashTabId, { cmd: 'CLAIM_CONFIRM' }, 15000);
         if (!c || !c.ok || !c.clicked) break;
@@ -638,7 +642,12 @@ async function runClaimStep(dashTabId, result, opts = {}) {
       }
       await sleep(600);
     }
-    const sum = await sendToTab(dashTabId, { cmd: 'SUMMARY' }, 10000);
+    let sum = await sendToTab(dashTabId, { cmd: 'SUMMARY' }, 10000);
+    if (!sum || !sum.ok) {
+      await waitForContentScript(dashTabId, 12);
+      await sleep(1000);
+      sum = await sendToTab(dashTabId, { cmd: 'SUMMARY' }, 10000);
+    }
     if (sum && sum.ok && sum.summary && sum.summary.points) info.points = sum.summary.points;
     info.status = info.clicked.length > 0 ? 'claimed' : 'none';
   } catch (e) {
@@ -664,7 +673,12 @@ async function runClaimOnly(reason = 'manual-claim') {
 
     await runClaimStep(vis.tabId, result, { budgetMs: 30000 });
     result.clicked = result.claimStep && result.claimStep.clicked ? result.claimStep.clicked.length : 0;
-    const sum = await sendToTab(vis.tabId, { cmd: 'SUMMARY' }, 10000);
+    let sum = await sendToTab(vis.tabId, { cmd: 'SUMMARY' }, 10000);
+    if (!sum.ok) {
+      await waitForContentScript(vis.tabId, 12);
+      await sleep(1000);
+      sum = await sendToTab(vis.tabId, { cmd: 'SUMMARY' }, 10000);
+    }
     if (sum.ok && sum.summary && sum.summary.points) result.pointsAfter = sum.summary.points;
     result.ok = result.claimStep.status !== 'error';
 
@@ -811,9 +825,14 @@ async function runTasks(reason = 'manual') {
       );
     }
 
-    // 8. 回读结果
+    // 8. 回读结果（页面若刚跳转过，先重连再读一次）
     await sleep(2000);
-    const sum = await sendToTab(dashTab.id, { cmd: 'SUMMARY' }, 10000);
+    let sum = await sendToTab(dashTab.id, { cmd: 'SUMMARY' }, 10000);
+    if (!sum.ok) {
+      await waitForContentScript(dashTab.id, 12);
+      await sleep(1000);
+      sum = await sendToTab(dashTab.id, { cmd: 'SUMMARY' }, 10000);
+    }
     if (sum.ok && sum.summary) {
       if (sum.summary.points) result.pointsAfter = sum.summary.points;
       result.afterSummary = sum.summary;
