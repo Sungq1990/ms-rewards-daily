@@ -1,6 +1,7 @@
 ﻿// background service worker：调度（每天随机时间 / 固定间隔+抖动）+ 任务执行主流程 + 标签页管理
 
 const ALARM_RUN = 'mrd-run';
+const ALARM_HEARTBEAT = 'mrd-heartbeat'; // 常驻心跳：定期唤醒 SW，防止空闲被回收
 const DASHBOARD_RE = /^https:\/\/rewards\.(bing|microsoft)\.com\/(dashboard)?\??/;
 const DEFAULTS = {
   enabled: true,
@@ -25,12 +26,13 @@ let keepAliveTimer = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const randInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
+// 用 chrome.alarms 做常驻心跳：MV3 的 setInterval 会随 SW 一起被杀，只有 alarms 能可靠唤醒。
+// 心跳只在 onInstalled/onStartup 建立，任务期的 keepAlive(false) 会清掉旧的 interval/心跳，随后 onAlarm 会自动补回。
 function keepAlive(on) {
-  if (on && !keepAliveTimer) {
-    keepAliveTimer = setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
-  } else if (!on && keepAliveTimer) {
-    clearInterval(keepAliveTimer);
-    keepAliveTimer = null;
+  if (on) {
+    chrome.alarms.create(ALARM_HEARTBEAT, { periodInMinutes: 0.5 }); // 最小间隔，保持 SW 活跃
+  } else {
+    chrome.alarms.clear(ALARM_HEARTBEAT);
   }
 }
 
@@ -120,6 +122,7 @@ async function scheduleNext(settings, { skipTodayCheck = false } = {}) {
 
 // 浏览器启动/安装时：如果今天的随机时刻已错过且今天没跑过，就补跑一次
 chrome.runtime.onStartup.addListener(async () => {
+  keepAlive(true); // 启动即建立常驻心跳
   const settings = await getSettings();
   if (!settings.enabled) return;
   const st = await getState();
@@ -136,10 +139,12 @@ chrome.runtime.onInstalled.addListener(async () => {
   const cur = await chrome.storage.local.get('settings');
   if (!cur.settings) await chrome.storage.local.set({ settings: DEFAULTS });
   const settings = await getSettings();
+  keepAlive(true); // 安装即建立常驻心跳
   await scheduleNext(settings);
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === ALARM_HEARTBEAT) { keepAlive(true); return; } // 心跳：仅保持活跃并补回，不执行任务
   if (alarm.name === ALARM_RUN) {
     (async () => {
       const settings = await getSettings();
@@ -704,7 +709,7 @@ async function runClaimOnly(reason = 'manual-claim') {
     result.finishedAt = Date.now();
     await saveState({ lastClaim: result });
     running = false;
-    keepAlive(false);
+    // 常驻心跳保持不清除，避免空闲期 SW 被回收导致漏跑
   }
   return result;
 }
@@ -882,7 +887,7 @@ async function runTasks(reason = 'manual') {
     result.finishedAt = Date.now();
     await saveState({ lastRun: result });
     running = false;
-    keepAlive(false);
+    // 常驻心跳保持不清除，避免空闲期 SW 被回收导致漏跑
     const s = await getSettings();
     if (s.enabled) await scheduleNext(s);
   }
