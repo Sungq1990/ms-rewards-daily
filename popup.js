@@ -19,13 +19,9 @@ const SEARCH_TEXT = {
   'not-found': '未找到入口',
   'click-failed': '点击失败',
   'no-tab': '未打开搜索页',
-  'content-not-ready': '搜索页未就绪',
-  'trigger-failed': '未触发油猴',
-  triggered: '已触发（后台继续跑）',
-  'already-running': '已在运行',
-  finished: '已完成',
-  'finished-tab-closed': '已完成',
-  'timeout-running': '已触发（仍在运行）',
+  searching: '搜索中',
+  searched: '已完成',
+  'search-failed': '未完成',
   error: '出错',
   skipped: '已跳过',
 };
@@ -66,13 +62,14 @@ function renderStatus(st) {
       res += `；赚取任务：${earnText(lr.earnStep)}`;
     }
     if (lr.searchStep && lr.searchStep.status) {
-      res += `；搜索打卡：${SEARCH_TEXT[lr.searchStep.status] || lr.searchStep.status}`;
+      const ss = lr.searchStep;
+      res += `；搜索打卡：${SEARCH_TEXT[ss.status] || ss.status}${ss.searched ? ` ${ss.searched} 次` : ''}`;
     }
     if (lr.claimStep && lr.claimStep.status) {
       res += `；领取：${claimText(lr.claimStep)}`;
     }
     $('lastResult').textContent = res;
-    $('lastResult').classList.toggle('bad', !lr.ok || (lr.searchStep && lr.searchStep.status === 'trigger-failed'));
+    $('lastResult').classList.toggle('bad', !lr.ok || (lr.searchStep && lr.searchStep.status === 'search-failed'));
     if (lr.pointsAfter) $('points').textContent = lr.pointsAfter + ' 分';
   }
   $('nextRun').textContent = st.nextRunAt ? fmtTime(st.nextRunAt) : '—';
@@ -86,7 +83,6 @@ function renderStatus(st) {
     $('enabled').checked = !!s.enabled;
     $('earnAfterDaily').checked = s.earnAfterDaily !== false;
     $('searchAfterDaily').checked = s.searchAfterDaily !== false;
-    $('searchNoWait').checked = s.searchNoWait !== false;
     $('claimPointsAfter').checked = s.claimPointsAfter !== false;
     $('mode').value = s.mode || 'daily';
     $('dailyStart').value = s.dailyStart || '08:00';
@@ -95,7 +91,6 @@ function renderStatus(st) {
     $('jitterPct').value = s.jitterPct ?? 15;
     $('dwellMinSec').value = s.dwellMinSec ?? 12;
     $('dwellMaxSec').value = s.dwellMaxSec ?? 25;
-    $('searchTimeoutMin').value = s.searchTimeoutMin ?? 15;
   }
   syncModeFields();
 }
@@ -110,8 +105,8 @@ function syncModeFields() {
 let settingsDirty = false;
 const FORM_FIELDS = [
   'mode', 'dailyStart', 'dailyEnd', 'intervalMin', 'jitterPct',
-  'dwellMinSec', 'dwellMaxSec', 'searchTimeoutMin',
-  'earnAfterDaily', 'searchAfterDaily', 'searchNoWait', 'claimPointsAfter',
+  'dwellMinSec', 'dwellMaxSec',
+  'earnAfterDaily', 'searchAfterDaily', 'claimPointsAfter',
 ];
 for (const id of FORM_FIELDS) {
   const el = $(id);
@@ -169,7 +164,6 @@ $('saveSettings').addEventListener('click', async () => {
     enabled: $('enabled').checked,
     earnAfterDaily: $('earnAfterDaily').checked,
     searchAfterDaily: $('searchAfterDaily').checked,
-    searchNoWait: $('searchNoWait').checked,
     claimPointsAfter: $('claimPointsAfter').checked,
     mode: $('mode').value,
     dailyStart: $('dailyStart').value || '08:00',
@@ -178,7 +172,6 @@ $('saveSettings').addEventListener('click', async () => {
     jitterPct: Math.max(0, Math.min(80, parseInt($('jitterPct').value, 10) || 15)),
     dwellMinSec: Math.max(5, parseInt($('dwellMinSec').value, 10) || 12),
     dwellMaxSec: Math.max(5, parseInt($('dwellMaxSec').value, 10) || 25),
-    searchTimeoutMin: Math.max(1, Math.min(60, parseInt($('searchTimeoutMin').value, 10) || 8)),
   };
   if (settings.dwellMaxSec < settings.dwellMinSec) settings.dwellMaxSec = settings.dwellMinSec;
   const r = await send({ cmd: 'SAVE_SETTINGS', settings });

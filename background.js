@@ -12,11 +12,8 @@ const DEFAULTS = {
   jitterPct: 15,            // 间隔模式：随机抖动百分比
   dwellMinSec: 12,          // 任务页最短停留
   dwellMaxSec: 25,          // 任务页最长停留
-  searchAfterDaily: true,   // 每日任务完成后触发必应搜索打卡（油猴自动搜索）
-  searchNoWait: true,       // 触发搜索后不等待脚本跑完（true）还是等它结束（false）
+  searchAfterDaily: true,   // 每日任务完成后完成必应搜索打卡（扩展自己随机搜索）
   earnAfterDaily: true,     // 每日任务完成后，点击"积分赚取"页日常任务
-  searchTimeoutMin: 15,     // 等待自动搜索脚本结束的最长时间（分钟）
-  closeSearchTabAfterFinish: true, // 搜索脚本结束后关闭搜索标签页
   claimPointsAfter: true,   // 搜索打卡后领取页面上出现的"可领取"积分
 };
 let running = false;
@@ -372,20 +369,75 @@ const SEARCH_STATUS_TEXT = {
   'not-found': '未找到入口',
   'click-failed': '点击失败',
   'no-tab': '未打开搜索页',
-  'content-not-ready': '搜索页未就绪',
-  'trigger-failed': '未触发油猴',
-  triggered: '已触发',
-  'already-running': '已在运行',
-  finished: '已完成',
-  'finished-tab-closed': '已完成',
-  'timeout-running': '已触发（仍在运行）',
+  searching: '搜索中',
+  searched: '已完成',
+  'search-failed': '未完成',
   error: '出错',
   skipped: '已跳过',
 };
 
-// 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 触发油猴"开始自动搜索"。
-// 默认触发完就返回（脚本很慢，让它自己在后台跑），只有关掉 searchNoWait 才会等它结束。
-async function runSearchStep(dashTabId, settings, result, opts = {}) {
+// 随机搜索用的主题词 + 数字后缀，避免每次都是同一个查询
+const SEARCH_TOPICS = [
+  '今天天气', '最新科技新闻', '人工智能 进展', '电影 推荐',
+  '家常菜 做法', '旅游 攻略', '健康 小知识', '英语 学习',
+  '篮球 比赛', '股票 行情', '数码 评测', '历史 故事',
+  '音乐 排行榜', '汽车 报价', '编程 教程', '科学 实验',
+];
+
+function pickSearchQuery() {
+  const base = SEARCH_TOPICS[randInt(0, SEARCH_TOPICS.length - 1)];
+  return `${base} ${randInt(10, 99)}`;
+}
+
+function bingOriginOf(url) {
+  const m = /^https?:\/\/([^/]+)/.exec(url || '');
+  return m ? `https://${m[1]}` : 'https://www.bing.com';
+}
+
+function tabQueryOf(tab) {
+  try { return new URL(tab.url).searchParams.get('q'); } catch (e) { return null; }
+}
+
+// 等标签页真正加载到目标查询的结果页（不只看 status=complete，避免拿到旧页面的状态）
+async function waitSearchLoaded(tabId, q, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  let sawLoading = false;
+  while (Date.now() < deadline) {
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t) return false;
+    if (t.status === 'loading') sawLoading = true;
+    else if (t.status === 'complete') {
+      if (tabQueryOf(t) === q) return true;
+      if (sawLoading) return false; // 加载完却不是这次的查询（被重定向/拦截）
+    }
+    await sleep(150);
+  }
+  return false;
+}
+
+// 在已打开的必应标签页里做 count 次搜索（直接跳结果页，不依赖页面脚本）
+async function performSearches(tabId, count) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const origin = bingOriginOf(tab && tab.url);
+  const queries = [];
+  await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+  for (let i = 0; i < count; i++) {
+    const q = pickSearchQuery();
+    queries.push(q);
+    const url = `${origin}/search?q=${encodeURIComponent(q)}&form=QBLH`;
+    const updated = await chrome.tabs.update(tabId, { url }).then(() => true).catch(() => false);
+    if (!updated) return { ok: false, queries, error: `第 ${i + 1} 次搜索无法打开页面` };
+    const done = await waitSearchLoaded(tabId, q, 30000);
+    if (!done) return { ok: false, queries, error: `第 ${i + 1} 次搜索未能打开结果页` };
+    setBadge(`搜索 ${i + 1}/${count}`, '#107c10');
+    if (i < count - 1) await sleep(randInt(2500, 5000));
+  }
+  return { ok: true, queries };
+}
+
+// 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 扩展在该标签页里随机搜索几次。
+// 不再依赖油猴脚本；搜索完成后直接进入领取阶段。
+async function runSearchStep(dashTabId, result) {
   const info = { status: 'skipped', startedAt: Date.now() };
   result.searchStep = info;
   try {
@@ -396,10 +448,18 @@ async function runSearchStep(dashTabId, settings, result, opts = {}) {
       info.error = (find && (find.error || find.reason)) || '未找到“立即搜索”入口';
       return info;
     }
-    if (!opts.force && find.counter && find.counter.total > 0 && find.counter.cur >= find.counter.total) {
+    if (find.counter && find.counter.total > 0 && find.counter.cur >= find.counter.total) {
       info.status = 'already-done';
       return info;
     }
+
+    // 按卡片上的"搜索: x/y"算还差几次，识别不到就默认 3 次
+    let count = 3;
+    if (find.counter && find.counter.total > 0) {
+      count = Math.max(0, find.counter.total - find.counter.cur);
+    }
+    count = Math.min(10, Math.max(1, count));
+    info.count = count;
 
     const tabsBefore = new Set((await chrome.tabs.query({})).map((t) => t.id));
     const click = await sendToTab(dashTabId, { cmd: 'CLICK_SEARCH' }, 20000);
@@ -418,71 +478,23 @@ async function runSearchStep(dashTabId, settings, result, opts = {}) {
     info.tabId = tab.id;
     await waitTabComplete(tab.id, 45000);
 
-    // 等 bing.js 就绪
-    let ready = false;
-    for (let i = 0; i < 20; i++) {
-      const r = await sendToTab(tab.id, { cmd: 'PING' }, 3000);
-      if (r && r.ok) { ready = true; break; }
-      await sleep(1200);
-    }
-    if (!ready) {
-      info.status = 'content-not-ready';
-      info.error = '搜索页脚本未就绪';
-      return info;
-    }
-
-    // 触发油猴"开始自动搜索"
-    const trig = await sendToTab(tab.id, { cmd: 'TRIGGER_USERSCRIPT' }, 45000);
-    if (!trig || !trig.ok) {
-      info.status = 'trigger-failed';
-      info.error = (trig && trig.error) || '触发油猴脚本失败';
-      return info;
-    }
-    info.status = trig.alreadyRunning ? 'already-running' : 'triggered';
+    info.status = 'searching';
     info.triggeredAt = Date.now();
     setBadge('搜索中', '#107c10');
-    await notify('微软积分每日任务', '已触发必应自动搜索，接下来领取「可领取」积分…');
 
-    // 默认不等待：自动搜索脚本很慢（可能要十几分钟），触发成功就够了，
-    // 标签页保持打开让脚本继续跑，这里直接返回去领取积分。
-    if (settings.searchNoWait !== false) {
-      info.noWait = true;
-      info.finishedAt = Date.now();
+    const run = await performSearches(tab.id, count);
+    info.queries = run.queries;
+    info.searched = run.queries.length;
+    info.finishedAt = Date.now();
+    if (!run.ok) {
+      info.status = 'search-failed';
+      info.error = run.error;
       return info;
     }
 
-    // 轮询按钮状态直到脚本结束或超时
-    const deadline = Date.now() + Math.max(1, settings.searchTimeoutMin || 8) * 60000;
-    let absent = 0;
-    while (Date.now() < deadline) {
-      await sleep(8000);
-      const exists = await chrome.tabs.get(tab.id).then(() => true).catch(() => false);
-      if (!exists) { info.status = 'finished-tab-closed'; break; }
-      const poll = await sendToTab(tab.id, { cmd: 'POLL_SEARCH' }, 5000);
-      if (!poll || !poll.ok) continue;
-      if (!poll.present) {
-        absent++;
-        if (absent >= 15) { info.status = 'finished'; break; } // 按钮消失且持续较久（约2分钟），视为结束
-        continue;
-      }
-      absent = 0;
-      if (poll.text && poll.text.includes('开始自动搜索')) { info.status = 'finished'; break; }
-    }
-    info.finishedAt = Date.now();
-    if (info.status === 'triggered' || info.status === 'already-running') info.status = 'timeout-running';
-
-    // 结束后关闭搜索标签页（可配置）
-    if (settings.closeSearchTabAfterFinish && (info.status === 'finished' || info.status === 'finished-tab-closed')) {
-      chrome.tabs.remove(tab.id).catch(() => {});
-    }
-
-    // 回读打卡计数（先把仪表盘激活，避免后台节流）
-    try {
-      await chrome.tabs.update(dashTabId, { active: true });
-      await sleep(1500);
-      const after = await sendToTab(dashTabId, { cmd: 'FIND_SEARCH_TASK' }, 30000);
-      if (after && after.counter) info.counterAfter = after.counter.text;
-    } catch (e) { /* 回读失败不影响结果 */ }
+    info.status = 'searched';
+    chrome.tabs.remove(tab.id).catch(() => {});
+    await notify('微软积分每日任务', `已完成 ${run.queries.length} 次必应搜索，接下来领取「可领取」积分…`);
     return info;
   } catch (e) {
     info.status = 'error';
@@ -724,7 +736,6 @@ async function runTasks(reason = 'manual') {
 
   let dashTab = null;
   let ownWinId = null;   // 本次运行专用的独立窗口（用完关闭）
-  let userWinId = null;  // 用户原来的窗口（后台仍在跑的搜索标签页要挪回那里）
   let prevTab = null;
   try {
     // 1. 准备一个"可见"的仪表盘：页面 hidden 时「每日活动」卡片不会懒加载，等再久也没用。
@@ -733,7 +744,6 @@ async function runTasks(reason = 'manual') {
     if (!vis.tabId) throw new Error('无法打开仪表盘页面');
     dashTab = { id: vis.tabId, windowId: vis.windowId };
     ownWinId = vis.ownWinId;
-    userWinId = vis.userWinId;
     result.dashWindow = ownWinId != null ? 'own' : 'reused';
 
     // 复用现有标签页时，先记下用户原来的活动标签页（结束后还原）
@@ -812,21 +822,20 @@ async function runTasks(reason = 'manual') {
       await sleep(1000);
     }
 
-    // 6. 必应搜索连续打卡：点击"立即搜索"→新标签页→触发油猴自动搜索
-    //    默认触发成功就返回（脚本很慢，让它在后台自己跑）
+    // 6. 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 扩展自己随机搜索几次
     if (settings.searchAfterDaily) {
-      await runSearchStep(dashTab.id, settings, result);
+      await runSearchStep(dashTab.id, result);
     }
 
-    // 7. 领取"可领取"积分（搜索打卡被触发后才会出现）
+    // 7. 领取"可领取"积分（搜索打卡完成后才会出现）
     if (settings.claimPointsAfter !== false) {
       const st = result.searchStep && result.searchStep.status;
-      const justTriggered = st === 'triggered' || st === 'already-running';
-      // 刚触发搜索时多给点时间等"可领取"出现；否则（今日已搜过/未触发）快速扫一轮
+      const justSearched = st === 'searched';
+      // 刚搜完时多给点时间等"可领取"出现；否则（今日已搜过/未执行）快速扫一轮
       await runClaimStep(
         dashTab.id,
         result,
-        justTriggered ? { graceMs: 20000, budgetMs: 150000 } : { budgetMs: 40000 }
+        justSearched ? { graceMs: 20000, budgetMs: 150000 } : { budgetMs: 40000 }
       );
     }
 
@@ -844,9 +853,9 @@ async function runTasks(reason = 'manual') {
     }
     setBadge('✓', '#107c10');
     setTimeout(() => setBadge(''), 8000);
-    const searchNote = result.searchStep && result.searchStep.status
-      ? `；搜索打卡：${SEARCH_STATUS_TEXT[result.searchStep.status] || result.searchStep.status}${
-        result.searchStep.noWait ? '（脚本在后台继续跑）' : ''}`
+    const ss = result.searchStep;
+    const searchNote = ss && ss.status
+      ? `；搜索打卡：${SEARCH_STATUS_TEXT[ss.status] || ss.status}${ss.searched ? ` ${ss.searched} 次` : ''}`
       : '';
     const earnNote = result.earnStep && result.earnStep.status
       ? `；赚取任务：${result.earnStep.clicked
@@ -869,17 +878,10 @@ async function runTasks(reason = 'manual') {
     setTimeout(() => setBadge(''), 10000);
     await notify('微软积分每日任务失败', result.error);
   } finally {
-    // 收尾：独立窗口用完就关（成功/失败都要）；还在后台跑自动搜索的标签页先挪回用户窗口
+    // 收尾：独立窗口用完就关（成功/失败都要）；否则还原用户原来正在看的标签页
     try {
       if (ownWinId != null) {
-        const searchTabId = result.searchStep && result.searchStep.noWait ? result.searchStep.tabId : null;
-        if (searchTabId && userWinId != null && userWinId !== ownWinId) {
-          await chrome.tabs.move(searchTabId, { windowId: userWinId, index: -1 }).catch(() => {});
-          await chrome.tabs.update(searchTabId, { active: false }).catch(() => {});
-        }
-        if (!searchTabId || userWinId != null) {
-          await chrome.windows.remove(ownWinId).catch(() => {});
-        }
+        await chrome.windows.remove(ownWinId).catch(() => {});
       } else if (prevTab != null) {
         chrome.tabs.update(prevTab, { active: true }).catch(() => {});
       }
