@@ -369,74 +369,20 @@ const SEARCH_STATUS_TEXT = {
   'not-found': '未找到入口',
   'click-failed': '点击失败',
   'no-tab': '未打开搜索页',
-  searching: '搜索中',
-  searched: '已完成',
-  'search-failed': '未完成',
+  'content-not-ready': '搜索页未就绪',
+  'trigger-failed': '未触发油猴',
+  triggered: '已触发',
+  finished: '已完成',
+  'timeout-running': '已触发（仍在运行）',
   error: '出错',
   skipped: '已跳过',
 };
 
-// 随机搜索用的主题词 + 数字后缀，避免每次都是同一个查询
-const SEARCH_TOPICS = [
-  '今天天气', '最新科技新闻', '人工智能 进展', '电影 推荐',
-  '家常菜 做法', '旅游 攻略', '健康 小知识', '英语 学习',
-  '篮球 比赛', '股票 行情', '数码 评测', '历史 故事',
-  '音乐 排行榜', '汽车 报价', '编程 教程', '科学 实验',
-];
+// 触发油猴脚本后，等首页「必应每日搜索」计数打满的最长时间
+const SEARCH_WAIT_BUDGET_MS = 15 * 60 * 1000;
 
-function pickSearchQuery() {
-  const base = SEARCH_TOPICS[randInt(0, SEARCH_TOPICS.length - 1)];
-  return `${base} ${randInt(10, 99)}`;
-}
-
-function bingOriginOf(url) {
-  const m = /^https?:\/\/([^/]+)/.exec(url || '');
-  return m ? `https://${m[1]}` : 'https://www.bing.com';
-}
-
-function tabQueryOf(tab) {
-  try { return new URL(tab.url).searchParams.get('q'); } catch (e) { return null; }
-}
-
-// 等标签页真正加载到目标查询的结果页（不只看 status=complete，避免拿到旧页面的状态）
-async function waitSearchLoaded(tabId, q, timeoutMs = 30000) {
-  const deadline = Date.now() + timeoutMs;
-  let sawLoading = false;
-  while (Date.now() < deadline) {
-    const t = await chrome.tabs.get(tabId).catch(() => null);
-    if (!t) return false;
-    if (t.status === 'loading') sawLoading = true;
-    else if (t.status === 'complete') {
-      if (tabQueryOf(t) === q) return true;
-      if (sawLoading) return false; // 加载完却不是这次的查询（被重定向/拦截）
-    }
-    await sleep(150);
-  }
-  return false;
-}
-
-// 在已打开的必应标签页里做 count 次搜索（直接跳结果页，不依赖页面脚本）
-async function performSearches(tabId, count) {
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
-  const origin = bingOriginOf(tab && tab.url);
-  const queries = [];
-  await chrome.tabs.update(tabId, { active: true }).catch(() => {});
-  for (let i = 0; i < count; i++) {
-    const q = pickSearchQuery();
-    queries.push(q);
-    const url = `${origin}/search?q=${encodeURIComponent(q)}&form=QBLH`;
-    const updated = await chrome.tabs.update(tabId, { url }).then(() => true).catch(() => false);
-    if (!updated) return { ok: false, queries, error: `第 ${i + 1} 次搜索无法打开页面` };
-    const done = await waitSearchLoaded(tabId, q, 30000);
-    if (!done) return { ok: false, queries, error: `第 ${i + 1} 次搜索未能打开结果页` };
-    setBadge(`搜索 ${i + 1}/${count}`, '#107c10');
-    if (i < count - 1) await sleep(randInt(2500, 5000));
-  }
-  return { ok: true, queries };
-}
-
-// 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 扩展在该标签页里随机搜索几次。
-// 不再依赖油猴脚本；搜索完成后直接进入领取阶段。
+// 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 触发油猴"开始自动搜索"；
+// 然后轮询首页的"搜索: x/y"计数，打满（x>=y）即视为每日搜索任务完成并关闭搜索标签页。
 async function runSearchStep(dashTabId, result) {
   const info = { status: 'skipped', startedAt: Date.now() };
   result.searchStep = info;
@@ -452,14 +398,6 @@ async function runSearchStep(dashTabId, result) {
       info.status = 'already-done';
       return info;
     }
-
-    // 按卡片上的"搜索: x/y"算还差几次，识别不到就默认 3 次
-    let count = 3;
-    if (find.counter && find.counter.total > 0) {
-      count = Math.max(0, find.counter.total - find.counter.cur);
-    }
-    count = Math.min(10, Math.max(1, count));
-    info.count = count;
 
     const tabsBefore = new Set((await chrome.tabs.query({})).map((t) => t.id));
     const click = await sendToTab(dashTabId, { cmd: 'CLICK_SEARCH' }, 20000);
@@ -478,23 +416,55 @@ async function runSearchStep(dashTabId, result) {
     info.tabId = tab.id;
     await waitTabComplete(tab.id, 45000);
 
-    info.status = 'searching';
-    info.triggeredAt = Date.now();
-    setBadge('搜索中', '#107c10');
-
-    const run = await performSearches(tab.id, count);
-    info.queries = run.queries;
-    info.searched = run.queries.length;
-    info.finishedAt = Date.now();
-    if (!run.ok) {
-      info.status = 'search-failed';
-      info.error = run.error;
+    // 等 bing.js 就绪
+    let ready = false;
+    for (let i = 0; i < 20; i++) {
+      const r = await sendToTab(tab.id, { cmd: 'PING' }, 3000);
+      if (r && r.ok) { ready = true; break; }
+      await sleep(1200);
+    }
+    if (!ready) {
+      info.status = 'content-not-ready';
+      info.error = '搜索页脚本未就绪';
       return info;
     }
 
-    info.status = 'searched';
-    chrome.tabs.remove(tab.id).catch(() => {});
-    await notify('微软积分每日任务', `已完成 ${run.queries.length} 次必应搜索，接下来领取「可领取」积分…`);
+    // 触发油猴"开始自动搜索"
+    const trig = await sendToTab(tab.id, { cmd: 'TRIGGER_USERSCRIPT' }, 45000);
+    if (!trig || !trig.ok) {
+      info.status = 'trigger-failed';
+      info.error = (trig && trig.error) || '触发油猴脚本失败';
+      return info;
+    }
+    info.triggeredAt = Date.now();
+    setBadge('搜索中', '#107c10');
+    await notify('微软积分每日任务', '已触发必应自动搜索，等待首页搜索打卡完成…');
+
+    // 轮询首页"搜索: x/y"计数：每轮把仪表盘带到前台几秒让计数刷新，
+    // 再让搜索标签页回到前台继续跑油猴脚本
+    const deadline = Date.now() + SEARCH_WAIT_BUDGET_MS;
+    while (Date.now() < deadline) {
+      await chrome.tabs.update(dashTabId, { active: true }).catch(() => {});
+      await sleep(2200);
+      const r = await sendToTab(dashTabId, { cmd: 'FIND_SEARCH_TASK' }, 12000);
+      if (r && r.ok && r.found && r.counter && r.counter.total > 0) {
+        info.counterNow = r.counter.text;
+        setBadge(`搜索 ${r.counter.cur}/${r.counter.total}`, '#107c10');
+        if (r.counter.cur >= r.counter.total) {
+          info.status = 'finished';
+          info.counterAfter = r.counter.text;
+          info.finishedAt = Date.now();
+          chrome.tabs.remove(tab.id).catch(() => {});
+          return info;
+        }
+      }
+      await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+      await sleep(6000);
+    }
+    // 超时：首页计数还没打满，保留搜索标签页让脚本继续跑
+    info.status = 'timeout-running';
+    info.counterAfter = info.counterNow || null;
+    info.finishedAt = Date.now();
     return info;
   } catch (e) {
     info.status = 'error';
@@ -822,7 +792,8 @@ async function runTasks(reason = 'manual') {
       await sleep(1000);
     }
 
-    // 6. 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 扩展自己随机搜索几次
+    // 6. 必应搜索连续打卡：点击"立即搜索"→ 新标签页 → 触发油猴自动搜索，
+    //    等首页"搜索: x/y"计数打满后关闭搜索标签页
     if (settings.searchAfterDaily) {
       await runSearchStep(dashTab.id, result);
     }
@@ -830,8 +801,8 @@ async function runTasks(reason = 'manual') {
     // 7. 领取"可领取"积分（搜索打卡完成后才会出现）
     if (settings.claimPointsAfter !== false) {
       const st = result.searchStep && result.searchStep.status;
-      const justSearched = st === 'searched';
-      // 刚搜完时多给点时间等"可领取"出现；否则（今日已搜过/未执行）快速扫一轮
+      const justSearched = st === 'finished' || st === 'timeout-running';
+      // 刚触发搜索时多给点时间等"可领取"出现；否则（今日已搜过/未执行）快速扫一轮
       await runClaimStep(
         dashTab.id,
         result,
@@ -855,7 +826,7 @@ async function runTasks(reason = 'manual') {
     setTimeout(() => setBadge(''), 8000);
     const ss = result.searchStep;
     const searchNote = ss && ss.status
-      ? `；搜索打卡：${SEARCH_STATUS_TEXT[ss.status] || ss.status}${ss.searched ? ` ${ss.searched} 次` : ''}`
+      ? `；搜索打卡：${SEARCH_STATUS_TEXT[ss.status] || ss.status}${ss.counterAfter ? `（${ss.counterAfter}）` : ''}`
       : '';
     const earnNote = result.earnStep && result.earnStep.status
       ? `；赚取任务：${result.earnStep.clicked

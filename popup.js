@@ -19,9 +19,11 @@ const SEARCH_TEXT = {
   'not-found': '未找到入口',
   'click-failed': '点击失败',
   'no-tab': '未打开搜索页',
-  searching: '搜索中',
-  searched: '已完成',
-  'search-failed': '未完成',
+  'content-not-ready': '搜索页未就绪',
+  'trigger-failed': '未触发油猴',
+  triggered: '已触发',
+  finished: '已完成',
+  'timeout-running': '已触发（仍在运行）',
   error: '出错',
   skipped: '已跳过',
 };
@@ -63,13 +65,13 @@ function renderStatus(st) {
     }
     if (lr.searchStep && lr.searchStep.status) {
       const ss = lr.searchStep;
-      res += `；搜索打卡：${SEARCH_TEXT[ss.status] || ss.status}${ss.searched ? ` ${ss.searched} 次` : ''}`;
+      res += `；搜索打卡：${SEARCH_TEXT[ss.status] || ss.status}${ss.counterAfter ? `（${ss.counterAfter}）` : ''}`;
     }
     if (lr.claimStep && lr.claimStep.status) {
       res += `；领取：${claimText(lr.claimStep)}`;
     }
     $('lastResult').textContent = res;
-    $('lastResult').classList.toggle('bad', !lr.ok || (lr.searchStep && lr.searchStep.status === 'search-failed'));
+    $('lastResult').classList.toggle('bad', !lr.ok || (lr.searchStep && lr.searchStep.status === 'trigger-failed'));
     if (lr.pointsAfter) $('points').textContent = lr.pointsAfter + ' 分';
   }
   $('nextRun').textContent = st.nextRunAt ? fmtTime(st.nextRunAt) : '—';
